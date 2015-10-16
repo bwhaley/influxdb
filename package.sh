@@ -449,12 +449,14 @@ for b in ${BINS[*]}; do
 done
 echo "${BINS[*]} copied to $TMP_WORK_DIR/$INSTALL_ROOT_DIR/"
 
+
 cp $INITD_SCRIPT $TMP_WORK_DIR/$INFLUXDB_SCRIPT_DIR/$INITD_SCRIPT
 if [ $? -ne 0 ]; then
     echo "Failed to copy init.d script to packaging directory ($TMP_WORK_DIR/$INFLUXDB_SCRIPT_DIR/) -- aborting."
     cleanup_exit 1
 fi
 echo "$INITD_SCRIPT copied to $TMP_WORK_DIR/$INFLUXDB_SCRIPT_DIR"
+
 
 cp $SYSTEMD_SCRIPT $TMP_WORK_DIR/$INFLUXDB_SCRIPT_DIR/$SYSTEMD_SCRIPT
 if [ $? -ne 0 ]; then
@@ -468,6 +470,7 @@ if [ $? -ne 0 ]; then
     echo "Failed to copy $SAMPLE_CONFIGURATION to packaging directory -- aborting."
     cleanup_exit 1
 fi
+
 
 install -m 644 $LOGROTATE $TMP_WORK_DIR/$LOGROTATE_DIR/influxdb
 if [ $? -ne 0 ]; then
