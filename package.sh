@@ -385,7 +385,7 @@ do
            usage 1
         fi
 
-        echo $VERSION | grep -i '[rc]' 2>&1 >/dev/null
+        echo $VERSION | grep -i '[r|rc]' 2>&1 >/dev/null
         if [ $? -ne 1 -a -z "$NIGHTLY_BUILD" ]; then
             echo
             echo "$VERSION contains reference to RC - specify RC separately"
