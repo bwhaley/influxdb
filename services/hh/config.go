@@ -23,7 +23,7 @@ const (
 	// attempting to flush hinted handoff queues. With each failure of a hinted
 	// handoff write, this retry interval increases exponentially until it reaches
 	// the maximum
-	DefaultRetryInterval = time.Second
+	DefaultRetryInterval = 10 * time.Second
 
 	// DefaultRetryMaxInterval is the maximum the hinted handoff retry interval
 	// will ever be.

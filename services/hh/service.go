@@ -3,9 +3,11 @@ package hh
 import (
 	"expvar"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,18 +31,14 @@ type Service struct {
 	wg      sync.WaitGroup
 	closing chan struct{}
 
+	processors map[uint64]*NodeProcessor
+
 	statMap *expvar.Map
 	Logger  *log.Logger
 	cfg     Config
 
-	ShardWriter shardWriter
-
-	HintedHandoff interface {
-		WriteShard(shardID, ownerID uint64, points []models.Point) error
-		Process() error
-		PurgeOlderThan(when time.Duration) error
-		PurgeInactiveOlderThan(when time.Duration) error
-	}
+	shardWriter shardWriter
+	metastore   metaStore
 }
 
 type shardWriter interface {
@@ -56,43 +54,52 @@ func NewService(c Config, w shardWriter, m metaStore) *Service {
 	key := strings.Join([]string{"hh", c.Dir}, ":")
 	tags := map[string]string{"path": c.Dir}
 
-	s := &Service{
-		cfg:     c,
-		statMap: influxdb.NewStatistics(key, "hh", tags),
-		Logger:  log.New(os.Stderr, "[handoff] ", log.LstdFlags),
+	return &Service{
+		cfg:         c,
+		statMap:     influxdb.NewStatistics(key, "hh", tags),
+		Logger:      log.New(os.Stderr, "[handoff] ", log.LstdFlags),
+		shardWriter: w,
+		metastore:   m,
 	}
-	processor, err := NewProcessor(c.Dir, w, m, ProcessorOptions{
-		MaxSize:        c.MaxSize,
-		RetryRateLimit: c.RetryRateLimit,
-	})
-	if err != nil {
-		s.Logger.Fatalf("Failed to start hinted handoff processor: %v", err)
-	}
-
-	processor.Logger = s.Logger
-	s.HintedHandoff = processor
-	return s
 }
 
 func (s *Service) Open() error {
-	if !s.cfg.Enabled {
-		// Allow Open to proceed, but don't anything.
-		return nil
-	}
-
-	s.Logger.Printf("Starting hinted handoff service")
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
+	if !s.cfg.Enabled {
+		// Allow Open to proceed, but don't do anything.
+		return nil
+	}
+	s.Logger.Printf("Starting hinted handoff service")
 	s.closing = make(chan struct{})
 
+	// Create the root directory if it doesn't already exist.
 	s.Logger.Printf("Using data dir: %v", s.cfg.Dir)
+	if err := os.MkdirAll(s.cfg.Dir, 0700); err != nil {
+		return fmt.Errorf("mkdir all: %s", err)
+	}
 
-	s.wg.Add(3)
-	go s.retryWrites()
-	go s.expireWrites()
-	go s.deleteInactiveQueues()
+	// Create a node processor for each node directory.
+	files, err := ioutil.ReadDir(s.cfg.Dir)
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		nodeID, err := strconv.ParseUint(file.Name(), 10, 64)
+		if err != nil {
+			return err
+		}
+
+		n := NewNodeProcessor(nodeID, s.pathforNode(nodeID), s.shardWriter, s.metastore)
+		if err := n.Open(); err != nil {
+			return err
+		}
+		s.processors[nodeID] = n
+	}
+
+	s.wg.Add(1)
+	go s.purgeInactiveProcessors()
 
 	return nil
 }
@@ -101,10 +108,18 @@ func (s *Service) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	for _, p := range s.processors {
+		if err := p.Close(); err != nil {
+			return err
+		}
+	}
+
 	if s.closing != nil {
 		close(s.closing)
 	}
 	s.wg.Wait()
+	s.closing = nil
+
 	return nil
 }
 
@@ -115,76 +130,51 @@ func (s *Service) SetLogger(l *log.Logger) {
 
 // WriteShard queues the points write for shardID to node ownerID to handoff queue
 func (s *Service) WriteShard(shardID, ownerID uint64, points []models.Point) error {
-	s.statMap.Add(writeShardReq, 1)
-	s.statMap.Add(writeShardReqPoints, int64(len(points)))
 	if !s.cfg.Enabled {
 		return ErrHintedHandoffDisabled
 	}
+	s.statMap.Add(writeShardReq, 1)
+	s.statMap.Add(writeShardReqPoints, int64(len(points)))
 
-	return s.HintedHandoff.WriteShard(shardID, ownerID, points)
-}
+	s.mu.RLock()
+	processor, ok := s.processors[ownerID]
+	s.mu.RUnlock()
+	if !ok {
+		if err := func() error {
+			// Check again under write-lock.
+			s.mu.Lock()
+			defer s.mu.Unlock()
 
-func (s *Service) retryWrites() {
-	defer s.wg.Done()
-	currInterval := time.Duration(s.cfg.RetryInterval)
-	if currInterval > time.Duration(s.cfg.RetryMaxInterval) {
-		currInterval = time.Duration(s.cfg.RetryMaxInterval)
-	}
-
-	for {
-
-		select {
-		case <-s.closing:
-			return
-		case <-time.After(currInterval):
-			s.statMap.Add(processReq, 1)
-			if err := s.HintedHandoff.Process(); err != nil && err != io.EOF {
-				s.statMap.Add(processReqFail, 1)
-				s.Logger.Printf("retried write failed: %v", err)
-
-				currInterval = currInterval * 2
-				if currInterval > time.Duration(s.cfg.RetryMaxInterval) {
-					currInterval = time.Duration(s.cfg.RetryMaxInterval)
+			processor, ok = s.processors[ownerID]
+			if !ok {
+				p := NewNodeProcessor(ownerID, s.pathforNode(ownerID), s.shardWriter, s.metastore)
+				if err := processor.Open(); err != nil {
+					return err
 				}
-			} else {
-				// Success! Return to configured interval.
-				currInterval = time.Duration(s.cfg.RetryInterval)
+				s.processors[ownerID] = p
+				processor = s.processors[ownerID]
 			}
+			return nil
+		}(); err != nil {
+			return err
 		}
 	}
-}
 
-// expireWrites will cause the handoff queues to remove writes that are older
-// than the configured threshold
-func (s *Service) expireWrites() {
-	defer s.wg.Done()
-	ticker := time.NewTicker(time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.closing:
-			return
-		case <-ticker.C:
-			if err := s.HintedHandoff.PurgeOlderThan(time.Duration(s.cfg.MaxAge)); err != nil {
-				s.Logger.Printf("purge write failed: %v", err)
-			}
-		}
+	if err := processor.WriteShard(shardID, points); err != nil {
+		return err
 	}
+
+	return nil
 }
 
 // deleteInactiveQueues will cause the service to remove queues for inactive nodes.
-func (s *Service) deleteInactiveQueues() {
+func (s *Service) purgeInactiveProcessors() {
 	defer s.wg.Done()
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
-	for {
-		select {
-		case <-s.closing:
-			return
-		case <-ticker.C:
-			if err := s.HintedHandoff.PurgeInactiveOlderThan(time.Duration(s.cfg.MaxAge)); err != nil {
-				s.Logger.Printf("delete queues failed: %v", err)
-			}
-		}
-	}
+}
+
+// pathforNode returns the directory for HH data, for the given node.
+func (s *Service) pathforNode(nodeID uint64) string {
+	return filepath.Join(s.cfg.Dir, fmt.Sprintf("%d", nodeID))
 }
